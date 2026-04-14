@@ -1,0 +1,55 @@
+package com.phoneguard.pro.security
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.location.Location
+import android.os.Looper
+import com.google.android.gms.location.*
+
+class GPSTracker(private val context: Context) {
+
+    private val fusedLocationClient =
+        LocationServices.getFusedLocationProviderClient(context)
+
+    private var currentLocation: Location? = null
+    private var isTracking = false
+
+    private val locationCallback = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) {
+            currentLocation = result.lastLocation
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startTracking() {
+        if (isTracking) return
+        val request = LocationRequest.Builder(
+            Priority.PRIORITY_HIGH_ACCURACY, 5000L
+        ).setMinUpdateIntervalMillis(3000L).build()
+
+        fusedLocationClient.requestLocationUpdates(
+            request, locationCallback, Looper.getMainLooper()
+        )
+        isTracking = true
+    }
+
+    @SuppressLint("MissingPermission")
+    suspend fun getCurrentLocation(): Location? {
+        startTracking()
+        // Give it a moment to get a fix
+        kotlinx.coroutines.delay(3000)
+        return currentLocation
+    }
+
+    fun getLocationString(): String {
+        return currentLocation?.let {
+            "Lat: ${it.latitude}, Lon: ${it.longitude}\n" +
+            "Maps: https://maps.google.com/?q=${it.latitude},${it.longitude}"
+        } ?: "Location unavailable"
+    }
+
+    fun stop() {
+        fusedLocationClient.removeLocationUpdates(locationCallback)
+        isTracking = false
+    }
+}

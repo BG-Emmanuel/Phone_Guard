@@ -1,0 +1,83 @@
+package com.phoneguard.pro.security
+
+import android.content.Context
+import android.location.Location
+import android.telephony.SmsManager
+import com.phoneguard.pro.data.PreferencesManager
+
+class SMSAlertManager(private val context: Context) {
+
+    private val prefs = PreferencesManager(context)
+
+    fun sendCriticalAlert(location: Location?, photoPath: String?) {
+        val contacts = prefs.getEmergencyContacts()
+        val locationStr = location?.let {
+            "Location: https://maps.google.com/?q=${it.latitude},${it.longitude}"
+        } ?: "Location unavailable"
+
+        val message = """
+            🚨 PHONEGUARD PRO - CRITICAL ALERT 🚨
+            Your phone is being accessed by an intruder!
+            $locationStr
+            Time: ${java.util.Date()}
+            Evidence photo has been captured.
+            Reply LOCK to remotely lock the device.
+        """.trimIndent()
+
+        contacts.forEach { number ->
+            sendSMS(number, message)
+        }
+    }
+
+    fun sendHighAlert(description: String, location: Location?) {
+        val contacts = prefs.getEmergencyContacts()
+        val locationStr = location?.let {
+            "https://maps.google.com/?q=${it.latitude},${it.longitude}"
+        } ?: "unavailable"
+
+        val message = "⚠️ PhoneGuard Alert: $description | Location: $locationStr"
+
+        contacts.forEach { number ->
+            sendSMS(number, message)
+        }
+    }
+
+    fun sendSilentAlert(description: String) {
+        // Logs silently — no SMS for low-level alerts
+        android.util.Log.d("PhoneGuard", "Silent alert: $description")
+    }
+
+    fun sendLocationUpdate(location: Location?) {
+        val contacts = prefs.getEmergencyContacts()
+        val locationStr = location?.let {
+            "https://maps.google.com/?q=${it.latitude},${it.longitude}"
+        } ?: "Location unavailable"
+
+        val message = "📍 PhoneGuard Tracking Update: Device location: $locationStr"
+        contacts.forEach { number -> sendSMS(number, message) }
+    }
+
+    fun sendSIMChangeAlert(newNumber: String) {
+        val contacts = prefs.getEmergencyContacts()
+        val message = """
+            ⚠️ PhoneGuard: SIM card was changed!
+            New number: $newNumber
+            Time: ${java.util.Date()}
+            Your phone may have been stolen.
+        """.trimIndent()
+        contacts.forEach { number -> sendSMS(number, message) }
+    }
+
+    private fun sendSMS(phoneNumber: String, message: String) {
+        try {
+            val smsManager = context.getSystemService(SmsManager::class.java)
+            // Split if message is too long
+            val parts = smsManager.divideMessage(message)
+            smsManager.sendMultipartTextMessage(
+                phoneNumber, null, parts, null, null
+            )
+        } catch (e: Exception) {
+            android.util.Log.e("PhoneGuard", "SMS failed: ${e.message}")
+        }
+    }
+}
