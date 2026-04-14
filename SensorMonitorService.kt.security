@@ -1,0 +1,286 @@
+package com.phoneguard.pro.security
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.hardware.*
+import android.os.*
+import androidx.core.app.NotificationCompat
+import com.phoneguard.pro.R
+import com.phoneguard.pro.data.AlertEvent
+import com.phoneguard.pro.data.AlertRepository
+import com.phoneguard.pro.data.AlertType
+import kotlinx.coroutines.*
+
+class SensorMonitorService : Service(), SensorEventListener {
+
+    private lateinit var sensorManager: SensorManager
+    private lateinit var accelerometer: Sensor
+    private lateinit var gyroscope: Sensor
+    private lateinit var lightSensor: Sensor
+    private lateinit var proximitySensor: Sensor
+
+    private lateinit var gpsTracker: GPSTracker
+    private lateinit var smsAlertManager: SMSAlertManager
+    private lateinit var intruderCaptureManager: IntruderCaptureManager
+    private lateinit var behaviorProfileManager: BehaviorProfileManager
+    private lateinit var repository: AlertRepository
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Thresholds
+    private val GRAB_THRESHOLD = 15.0f       // m/s² - sudden grab force
+    private val SHAKE_THRESHOLD = 12.0f      // m/s²
+    private val GYRO_THRESHOLD = 3.5f        // rad/s - unnatural rotation
+    private val LOW_LIGHT_THRESHOLD = 5.0f   // lux - camera being covered
+
+    // State tracking
+    private var lastAccelValues = FloatArray(3)
+    private var isPhoneInPocket = false
+    private var lastProximityValue = 0f
+    private var isMonitoring = false
+    private var wrongPinCount = 0
+
+    companion object {
+        const val CHANNEL_ID = "PhoneGuardChannel"
+        const val NOTIFICATION_ID = 1
+        const val ACTION_START = "ACTION_START_MONITORING"
+        const val ACTION_STOP = "ACTION_STOP_MONITORING"
+        const val ACTION_WRONG_PIN = "ACTION_WRONG_PIN_DETECTED"
+
+        fun startService(context: Context) {
+            val intent = Intent(context, SensorMonitorService::class.java)
+                .apply { action = ACTION_START }
+            context.startForegroundService(intent)
+        }
+
+        fun stopService(context: Context) {
+            val intent = Intent(context, SensorMonitorService::class.java)
+                .apply { action = ACTION_STOP }
+            context.startService(intent)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        initializeDependencies()
+        createNotificationChannel()
+        registerSensors()
+    }
+
+    private fun initializeDependencies() {
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)!!
+        gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)!!
+        lightSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)!!
+        proximitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)!!
+
+        gpsTracker = GPSTracker(this)
+        smsAlertManager = SMSAlertManager(this)
+        intruderCaptureManager = IntruderCaptureManager(this)
+        behaviorProfileManager = BehaviorProfileManager(this)
+        repository = AlertRepository(this)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> {
+                startForeground(NOTIFICATION_ID, buildNotification())
+                isMonitoring = true
+            }
+            ACTION_STOP -> {
+                isMonitoring = false
+                stopSelf()
+            }
+            ACTION_WRONG_PIN -> {
+                wrongPinCount++
+                handleWrongPin()
+            }
+        }
+        return START_STICKY // restarts if killed
+    }
+
+    private fun registerSensors() {
+        sensorManager.registerListener(this, accelerometer,
+            SensorManager.SENSOR_DELAY_NORMAL)
+        sensorManager.registerListener(this, gyroscope,
+            SensorManager.SENSOR_DELAY_NORMAL)
+        sensorManager.registerListener(this, lightSensor,
+            SensorManager.SENSOR_DELAY_NORMAL)
+        sensorManager.registerListener(this, proximitySensor,
+            SensorManager.SENSOR_DELAY_NORMAL)
+    }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (!isMonitoring || event == null) return
+
+        when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> handleAccelerometer(event.values)
+            Sensor.TYPE_GYROSCOPE -> handleGyroscope(event.values)
+            Sensor.TYPE_LIGHT -> handleLightSensor(event.values[0])
+            Sensor.TYPE_PROXIMITY -> handleProximity(event.values[0])
+        }
+    }
+
+    private fun handleAccelerometer(values: FloatArray) {
+        val x = values[0]
+        val y = values[1]
+        val z = values[2]
+
+        // Calculate total acceleration magnitude
+        val magnitude = Math.sqrt(
+            (x * x + y * y + z * z).toDouble()
+        ).toFloat()
+
+        // Detect sudden grab (violent acceleration spike)
+        if (magnitude > GRAB_THRESHOLD) {
+            triggerAlert(AlertType.GRAB_DETECTED,
+                "Violent grab motion detected! Magnitude: $magnitude m/s²")
+        }
+
+        // Feed to behavior profile for learning
+        behaviorProfileManager.recordAccelerometerData(values)
+
+        // Check behavioral anomaly
+        if (behaviorProfileManager.isAnomalousBehavior(values)) {
+            triggerAlert(AlertType.BEHAVIOR_ANOMALY,
+                "Unusual phone handling behavior detected")
+        }
+
+        lastAccelValues = values
+    }
+
+    private fun handleGyroscope(values: FloatArray) {
+        val rotationMagnitude = Math.sqrt(
+            (values[0] * values[0] +
+             values[1] * values[1] +
+             values[2] * values[2]).toDouble()
+        ).toFloat()
+
+        if (rotationMagnitude > GYRO_THRESHOLD) {
+            behaviorProfileManager.recordGyroData(values)
+        }
+    }
+
+    private fun handleLightSensor(lux: Float) {
+        // Very low light = camera might be covered by finger
+        if (lux < LOW_LIGHT_THRESHOLD && !isPhoneInPocket) {
+            triggerAlert(AlertType.CAMERA_COVERED,
+                "Front camera may be covered. Lux: $lux")
+        }
+    }
+
+    private fun handleProximity(distance: Float) {
+        val wasInPocket = isPhoneInPocket
+        isPhoneInPocket = distance < 2.0f // less than 2cm = in pocket
+
+        // Phone just left pocket without being unlocked by owner
+        if (wasInPocket && !isPhoneInPocket) {
+            serviceScope.launch {
+                delay(2000) // 2 second grace period
+                // Check if screen was properly unlocked
+                triggerAlert(AlertType.POCKET_EXIT,
+                    "Phone removed from pocket without authentication")
+            }
+        }
+
+        lastProximityValue = distance
+    }
+
+    private fun handleWrongPin() {
+        val level = when {
+            wrongPinCount >= 5 -> AlertLevel.CRITICAL
+            wrongPinCount >= 3 -> AlertLevel.HIGH
+            else -> AlertLevel.MEDIUM
+        }
+        triggerAlert(AlertType.WRONG_PIN,
+            "Wrong PIN entered $wrongPinCount time(s)", level)
+    }
+
+    private fun triggerAlert(
+        type: AlertType,
+        description: String,
+        level: AlertLevel = AlertLevel.HIGH
+    ) {
+        serviceScope.launch {
+            val location = gpsTracker.getCurrentLocation()
+
+            // Capture intruder evidence
+            val photoPath = intruderCaptureManager.captureIntruderPhoto()
+            val audioPath = intruderCaptureManager.recordSurroundingAudio(15)
+
+            // Save to database
+            val alertEvent = AlertEvent(
+                type = type.name,
+                description = description,
+                timestamp = System.currentTimeMillis(),
+                latitude = location?.latitude ?: 0.0,
+                longitude = location?.longitude ?: 0.0,
+                photoPath = photoPath ?: "",
+                audioPath = audioPath ?: "",
+                alertLevel = level.name
+            )
+            repository.insertAlert(alertEvent)
+
+            // Send SMS alert based on threat level
+            when (level) {
+                AlertLevel.CRITICAL -> {
+                    smsAlertManager.sendCriticalAlert(location, photoPath)
+                    intruderCaptureManager.triggerAlarm()
+                    startContinuousTracking()
+                }
+                AlertLevel.HIGH -> {
+                    smsAlertManager.sendHighAlert(description, location)
+                }
+                AlertLevel.MEDIUM -> {
+                    smsAlertManager.sendSilentAlert(description)
+                }
+            }
+        }
+    }
+
+    private fun startContinuousTracking() {
+        serviceScope.launch {
+            repeat(10) { // track for ~20 minutes
+                delay(120_000) // every 2 minutes
+                val location = gpsTracker.getCurrentLocation()
+                smsAlertManager.sendLocationUpdate(location)
+                intruderCaptureManager.captureIntruderPhoto()
+            }
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("PhoneGuard Pro")
+            .setContentText("Security monitoring active")
+            .setSmallIcon(R.drawable.ic_shield)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "PhoneGuard Security",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Security monitoring service"
+        }
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onBind(intent: Intent?) = null
+
+    override fun onDestroy() {
+        super.onDestroy()
+        sensorManager.unregisterListener(this)
+        serviceScope.cancel()
+        gpsTracker.stop()
+    }
+}
+
+enum class AlertLevel { MEDIUM, HIGH, CRITICAL }
