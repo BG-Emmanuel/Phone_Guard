@@ -1,0 +1,34 @@
+package com.phoneguard.pro.security
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import com.phoneguard.pro.data.PreferencesManager
+
+// Auto-starts service on phone boot
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+            val prefs = PreferencesManager(context)
+            if (prefs.isMonitoringEnabled()) {
+                SensorMonitorService.startService(context)
+            }
+        }
+    }
+}
+
+// Detects SIM card changes
+class SIMChangeReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == "android.intent.action.SIM_STATE_CHANGED") {
+            val simState = intent.getStringExtra("ss") ?: return
+            if (simState == "LOADED") {
+                val smsManager = SMSAlertManager(context)
+                val prefs = PreferencesManager(context)
+                val savedSIM = prefs.getString("saved_sim_serial", "")
+                // If SIM changed, alert contacts
+                smsManager.sendSIMChangeAlert("New SIM detected")
+            }
+        }
+    }
+}

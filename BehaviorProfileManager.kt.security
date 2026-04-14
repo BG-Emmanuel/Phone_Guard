@@ -1,0 +1,64 @@
+package com.phoneguard.pro.security
+
+import android.content.Context
+import com.phoneguard.pro.data.PreferencesManager
+import kotlin.math.abs
+import kotlin.math.sqrt
+
+class BehaviorProfileManager(private val context: Context) {
+
+    private val prefs = PreferencesManager(context)
+
+    // Rolling averages of owner's normal behavior
+    private var avgAccelMagnitude = 0f
+    private var sampleCount = 0
+    private val LEARNING_SAMPLES = 500
+    private val ANOMALY_THRESHOLD = 0.35f // 35% deviation
+
+    fun recordAccelerometerData(values: FloatArray) {
+        val magnitude = sqrt(
+            (values[0] * values[0] +
+             values[1] * values[1] +
+             values[2] * values[2]).toDouble()
+        ).toFloat()
+
+        if (sampleCount < LEARNING_SAMPLES) {
+            // Learning phase — build the owner's profile
+            avgAccelMagnitude = ((avgAccelMagnitude * sampleCount) + magnitude) /
+                (sampleCount + 1)
+            sampleCount++
+            prefs.saveFloat("avg_accel", avgAccelMagnitude)
+            prefs.saveInt("sample_count", sampleCount)
+        }
+    }
+
+    fun recordGyroData(values: FloatArray) {
+        // Store gyroscope patterns for future ML integration
+        val magnitude = sqrt(
+            (values[0] * values[0] +
+             values[1] * values[1] +
+             values[2] * values[2]).toDouble()
+        ).toFloat()
+        prefs.saveFloat("avg_gyro", magnitude)
+    }
+
+    fun isAnomalousBehavior(values: FloatArray): Boolean {
+        // Only check after learning phase
+        if (sampleCount < LEARNING_SAMPLES) return false
+
+        val storedAvg = prefs.getFloat("avg_accel", 0f)
+        if (storedAvg == 0f) return false
+
+        val magnitude = sqrt(
+            (values[0] * values[0] +
+             values[1] * values[1] +
+             values[2] * values[2]).toDouble()
+        ).toFloat()
+
+        val deviation = abs(magnitude - storedAvg) / storedAvg
+        return deviation > ANOMALY_THRESHOLD
+    }
+
+    fun isProfileLearned(): Boolean =
+        prefs.getInt("sample_count", 0) >= LEARNING_SAMPLES
+}
